@@ -1,0 +1,10 @@
+# Production Roadmap
+## MiniSearch → High-Scale Deployment
+
+### Architectural Transformation
+
+The current single-machine, in-memory design would require decomposition into three independent tiers for production. The crawler workers should be extracted into stateless containers orchestrated by Kubernetes, enabling horizontal scaling by simply adding pods — each pod pulls URLs from a central queue rather than a local `queue.Queue`. Apache Kafka or Redis Streams would replace the in-memory queue, providing durable message storage, consumer group coordination, and built-in back-pressure via consumer lag metrics. The HTML parser and indexer should become separate microservices; a parsing failure in one worker no longer affects other components, and each tier can be scaled independently based on observed bottlenecks. For the search index, Elasticsearch or Apache Solr would replace the custom inverted index, providing replication, shard management, and query optimization that would otherwise take months to engineer correctly.
+
+### Reliability and Observability
+
+Every crawler worker should expose Prometheus metrics — requests per second, error rate by status code, queue consumer lag, and p95 fetch latency — visualized in Grafana dashboards with alerting thresholds. The visited set and URL frontier must be stored in Redis or PostgreSQL rather than in-memory files, so that any pod restart or rolling deployment continues crawling without restarting from the seed. Rate limiting should be enforced per domain using a token bucket algorithm, respecting `Crawl-Delay` headers from `robots.txt` and backing off exponentially on 429 or 503 responses. Duplicate content detection should use SimHash or MinHash to catch near-duplicate pages that share different URLs — this reduces index size and improves search quality. A circuit breaker pattern should automatically suspend crawling of domains that consistently return errors, protecting both the target server and the crawler's own throughput.
