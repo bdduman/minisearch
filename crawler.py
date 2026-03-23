@@ -160,6 +160,7 @@ class InvertedIndex:
                 "origin_url": record.origin_url,
                 "depth":      record.depth,
                 "title":      record.title,
+                "frequency":  freq.get(word, 0),
                 "score":      score,
                 "in_title":   in_title,
                 "in_url":     in_url,
@@ -208,6 +209,9 @@ class InvertedIndex:
         if not combined:
             return []
 
+        for r in combined.values():
+            r["relevance_score"] = r["score"]
+
         total = len(tokens)
         return sorted(
             combined.values(),
@@ -223,10 +227,13 @@ class InvertedIndex:
         """Sadece sayfa içeriklerini kaydeder (site geneli indeks)."""
         with self._lock:
             data = {"pages": [asdict(p) for p in self._pages]}
+            index_snapshot = dict(self._index)
         with open(path, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
         size_kb = len(json.dumps(data)) // 1024
         log.info(f"Indeks kaydedildi: {path} ({len(self._pages)} sayfa, ~{size_kb}KB)")
+
+        # p.data yazımı app.py'den yapılır (tüm crawler'lar birleştirilir)
 
     def load(self, path: str):
         """Sayfa içeriklerini yükler, indeksi yeniden oluşturur."""
@@ -282,6 +289,7 @@ class InvertedIndex:
                 "origin_url": record.origin_url,
                 "depth":      record.depth,
                 "title":      record.title,
+                "frequency":  freq.get(word, 0),
                 "score":      score,
                 "in_title":   in_title,
                 "in_url":     in_url,
@@ -329,8 +337,7 @@ class Crawler:
         save_path: Optional[str] = None,
         state_path: Optional[str] = None,
         log_path: Optional[str] = None,
-        shared_visited: Optional[set] = None,
-        shared_visited_lock: Optional[object] = None,
+        on_finish=None,
     ):
         self.seed_url = seed_url
         self.crawler_id = crawler_id
@@ -349,14 +356,8 @@ class Crawler:
 
         # Thread-safe veri yapilari
         self._url_queue: queue.Queue = queue.Queue(maxsize=max_queue_size)
-
-        # Shared visited: birden fazla crawler aynı set'i paylaşabilir
-        if shared_visited is not None:
-            self._visited = shared_visited
-            self._visited_lock = shared_visited_lock
-        else:
-            self._visited: set[str] = set()
-            self._visited_lock = threading.Lock()
+        self._visited: set[str] = set()
+        self._visited_lock = threading.Lock()
 
         self.index = InvertedIndex()
         self.stats = CrawlStats()
@@ -364,6 +365,7 @@ class Crawler:
 
         self._workers: list[threading.Thread] = []
         self._stop_event = threading.Event()
+        self.on_finish = on_finish  # callback: doğal bitiş sonrası çağrılır
 
     # ------------------------------------------------------------------
     # Public API
@@ -392,22 +394,50 @@ class Crawler:
 
     def resume(self):
         """Mevcut crawler'ı kaldığı yerden devam ettirir.
-        visited, indeks, stats — hiçbiri sıfırlanmaz.
-        Kuyrukta URL varsa oradan, yoksa tarama bitmiş demektir."""
+        Önce frontier+visited yükler, sonra worker'ları başlatır."""
         if self.stats.running:
             return
 
-        queue_size = self._url_queue.qsize()
-        log.info(f"Resume: kuyrukta {queue_size} URL, "
-                 f"indeks={self.index.page_count()}, visited={len(self._visited)}")
+        import os, json as _json
 
-        # Kuyruk tamamen boşsa tarama zaten bitmişti — birşey yapma
+        # 1. State dosyasından frontier + visited yükle
+        if self.state_path and os.path.exists(self.state_path):
+            try:
+                with open(self.state_path) as f:
+                    state = _json.load(f)
+                frontier = [tuple(item) for item in state.get("frontier", [])]
+                visited  = set(state.get("visited", []))
+                with self._visited_lock:
+                    self._visited = visited
+                # Kuyruğu temizle ve frontier'i yükle
+                while not self._url_queue.empty():
+                    try: self._url_queue.get_nowait()
+                    except: break
+                loaded = 0
+                for item in frontier:
+                    try:
+                        self._url_queue.put_nowait(item)
+                        loaded += 1
+                    except: break
+                with self._stats_lock:
+                    self.stats.processed = state.get("processed", self.stats.processed)
+                log.info(f"State yüklendi: {len(visited)} visited, {loaded} frontier kuyruğa eklendi")
+            except Exception as e:
+                log.warning(f"State yuklenemedi: {e}")
+
+        # 2. Hâlâ boşsa seed'den başla
         if self._url_queue.empty():
-            log.info("Kuyruk boş, tarama tamamlanmıştı. Resume edilmedi.")
-            with self._stats_lock:
-                self.stats.running = False
-            return
+            with self._visited_lock:
+                self._visited.discard(self.seed_url)
+                self._visited.discard(self.seed_url.rstrip("/"))
+                self._visited.discard(self.seed_url + "/")
+            self._url_queue.put((self.seed_url, self.seed_url, 0))
+            log.info("Frontier boş, seed'den devam (visited korunuyor)")
 
+        queue_size = self._url_queue.qsize()
+        log.info(f"Resume: {queue_size} URL kuyrukta, {len(self._visited)} visited, {self.index.page_count()} indeks")
+
+        # 3. Frontier hazır, şimdi worker'ları başlat
         self._stop_event.clear()
         with self._stats_lock:
             self.stats.running = True
@@ -421,7 +451,7 @@ class Crawler:
             )
             t.start()
             self._workers.append(t)
-        log.info(f"Resume edildi: {self.max_workers} worker, {queue_size} URL işlenecek")
+        log.info(f"Resume edildi: {self.max_workers} worker başlatıldı")
 
     def _write_log(self, event: str, url: str, depth: int, origin: str,
                    title: str = "", error: str = ""):
@@ -505,15 +535,30 @@ class Crawler:
     # Worker
     # ------------------------------------------------------------------
     def _worker(self):
+        empty_count = 0  # arka arkaya kaç kez boş gördük
         while not self._stop_event.is_set():
             try:
-                url, origin, depth = self._url_queue.get(timeout=1)
+                url, origin, depth = self._url_queue.get(timeout=2)
+                empty_count = 0  # URL geldi, sayacı sıfırla
             except queue.Empty:
-                # Kuyruk bos ve calisan baska sey yok - bitti
-                if self._url_queue.empty():
+                empty_count += 1
+                # Birkaç kez üst üste boş görünce gerçekten bitti say
+                # (frontier yüklenme gecikmesini tolere et)
+                if empty_count >= 3 and self._url_queue.empty():
                     with self._stats_lock:
                         self.stats.running = False
                     self._stop_event.set()
+                    # Doğal bitiş: index.json kaydet + callback
+                    if self.save_path:
+                        try:
+                            self.index.save(self.save_path)
+                        except Exception as e:
+                            log.warning(f"Doğal bitiş save hatası: {e}")
+                    if self.on_finish:
+                        try:
+                            self.on_finish()
+                        except Exception:
+                            pass
                 continue
 
             try:
@@ -536,6 +581,17 @@ class Crawler:
                 if self.stats.processed >= self.max_urls:
                     self._stop_event.set()
                     self.stats.running = False
+                    # Max URL bitiş: index.json kaydet + callback
+                    if self.save_path:
+                        try:
+                            self.index.save(self.save_path)
+                        except Exception as e:
+                            log.warning(f"Max URL save hatası: {e}")
+                    if self.on_finish:
+                        try:
+                            self.on_finish()
+                        except Exception:
+                            pass
                     return
 
         # Ziyaret kontrolu

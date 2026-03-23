@@ -25,9 +25,37 @@ app = Flask(__name__)
 crawlers: dict[str, Crawler] = {}
 crawlers_lock = threading.Lock()
 
-# Domain bazlı shared visited: aynı domain'i tarayan crawlerlar URL'yi çift ziyaret etmez
-shared_visited_store: dict[str, set] = {}       # domain → visited set
-shared_visited_locks: dict[str, object] = {}     # domain → lock
+# Her crawler kendi visited set'ini kullanır
+# Aynı URL'yi iki kez indeksleme add_page() içindeki _url_set ile önlenir
+
+
+def save_pdata():
+    """Tüm crawler'ların indeksini birleştirip data/storage/p.data'ya yazar."""
+    _base = os.path.dirname(os.path.abspath(__file__))
+    _pdata_dir = os.path.join(_base, "data", "storage")
+    os.makedirs(_pdata_dir, exist_ok=True)
+    _pdata_path = os.path.join(_pdata_dir, "p.data")
+
+    all_entries = []
+    with crawlers_lock:
+        for c in crawlers.values():
+            with c.index._lock:
+                for word, entries in c.index._index.items():
+                    for entry in entries:
+                        all_entries.append((
+                            word,
+                            entry.get("url", ""),
+                            entry.get("origin_url", ""),
+                            entry.get("depth", 0),
+                            entry.get("frequency", 0),
+                        ))
+
+    all_entries.sort(key=lambda x: (x[0], x[1]))
+    with open(_pdata_path, "w", encoding="utf-8") as f:
+        for word, url, orig, depth, freq in all_entries:
+            f.write(f"{word} {url} {orig} {depth} {freq}\n")
+    log.info(f"p.data kaydedildi: {_pdata_path} ({len(all_entries)} entry, {len(set(c.crawler_id for c in crawlers.values()))} crawler)")
+
 
 # ---------------------------------------------------------------------------
 # HTML Sayfasi
@@ -154,7 +182,7 @@ HTML = r"""<!DOCTYPE html>
 <body>
 <div class="wrap">
   <header>
-    <div class="logo">CRAWLER<span>Search</span></div>
+    <div class="logo">Mini<span>Search</span></div>
     <small style="color:var(--muted);font-size:.75rem">ITU · AI Aided Computer Engineering</small>
     <div class="hdot" id="main-dot"></div>
   </header>
@@ -162,7 +190,7 @@ HTML = r"""<!DOCTYPE html>
   <div id="start-section">
     <h2>&#9889; Tarama Başlat</h2>
     <div class="form-row">
-      <div><label>Seed URL</label><input type="text" id="seed-url" value="https://ninova.itu.edu.tr/" placeholder="https://..."></div>
+      <div><label>Seed URL</label><input type="text" id="seed-url" value="https://python.org" placeholder="https://..."></div>
       <div><label>Derinlik</label><input type="number" id="depth" value="2" min="1" max="5" style="width:80px"></div>
       <div><label>Workers</label><input type="number" id="workers" value="5" min="1" max="20" style="width:80px"></div>
       <div><label>Rate/s</label><input type="number" id="rate" value="2" min="0.5" max="10" step="0.5" style="width:80px"></div>
@@ -568,8 +596,9 @@ def start_crawl():
     import re, os
     domain = re.sub(r"[^a-z0-9]", "_", url.lower().split("//")[-1].split("/")[0])
 
-    # Storage klasörü
-    storage_dir = os.path.join("storage", "crawlers", cid)
+    # Storage klasörü (absolute path — VSCode farklı cwd'den çalışabilir)
+    _base = os.path.dirname(os.path.abspath(__file__))
+    storage_dir = os.path.join(_base, "storage", "crawlers", cid)
     os.makedirs(storage_dir, exist_ok=True)
 
     save_path  = os.path.join(storage_dir, "index.json")
@@ -591,22 +620,6 @@ def start_crawl():
         # Shared visited mantığı:
         # - Aynı anda çalışan crawlerlar aynı in-memory set'i paylaşır
         # - Fresh başlarken: önce diskten yükle (önceki taramalar korunur)
-        # - Böylece aynı URL asla iki kez taranmaz (farklı crawler, farklı zaman)
-        running_same = [
-            c for c in crawlers.values()
-            if c.stats.running and _up.urlparse(c.seed_url).netloc == domain_key
-        ]
-        if running_same:
-            # Aynı anda çalışan var → aynı set'i paylaş → çift ziyaret yok
-            shared_visited_store[domain_key] = running_same[0]._visited
-            shared_visited_locks[domain_key] = running_same[0]._visited_lock
-            log.info(f"Shared visited: #{running_same[0].crawler_id} ile paylaşılıyor")
-        else:
-            # Kimse çalışmıyor → temiz set başlat
-            # (index.json zaten ne işlediğimizi biliyor, add_page duplicate'i reddeder)
-            shared_visited_store[domain_key] = set()
-            shared_visited_locks[domain_key] = threading.Lock()
-
         c = Crawler(
             seed_url=url,
             crawler_id=cid,
@@ -619,8 +632,7 @@ def start_crawl():
             save_path=save_path,
             state_path=state_path,
             log_path=log_path,
-            shared_visited=shared_visited_store[domain_key],
-            shared_visited_lock=shared_visited_locks[domain_key],
+            on_finish=save_pdata,
         )
 
         resumed_index = 0
@@ -703,8 +715,7 @@ def load_index():
 
 @app.route("/resume", methods=["POST"])
 def resume_crawl():
-    """Mevcut crawler nesnesini sıfırlamadan devam ettirir.
-    visited, indeks, stats korunur. Kuyrukta kalan frontier'den devam eder."""
+    """Mevcut crawler nesnesini sıfırlamadan devam ettirir."""
     data = request.get_json() or {}
     cid  = str(data.get("crawler_id", "1"))
 
@@ -715,20 +726,25 @@ def resume_crawl():
         if c.stats.running:
             return jsonify({"status": "already_running"})
 
-        # Kuyruk durumunu logla
-        q_size = c._url_queue.qsize()
-        visited_size = len(c._visited)
-        log.info(f"RESUME #{cid}: kuyruk={q_size}, visited={visited_size}, indeks={c.index.page_count()}")
+        # Sunucu yeniden başlatılmışsa indeks bellekte yok — diskten yükle
+        if c.index.page_count() == 0 and c.save_path and os.path.exists(c.save_path):
+            try:
+                c.index.load(c.save_path)
+                with c._stats_lock:
+                    c.stats.processed = c.index.page_count()
+                log.info(f"RESUME #{cid}: indeks diskten yüklendi ({c.index.page_count()} sayfa)")
+            except Exception as e:
+                log.warning(f"Indeks yuklenemedi: {e}")
 
-        c.resume()
+        c.resume()  # frontier state.json'dan yüklenir
 
     return jsonify({
         "status":     "resumed",
         "crawler_id": cid,
         "index_size": c.index.page_count(),
         "processed":  c.stats.processed,
-        "visited":    visited_size,
-        "queue_size": q_size,
+        "visited":    len(c._visited),
+        "queue_size": c._url_queue.qsize(),
     })
 
 
@@ -741,9 +757,8 @@ def stop_crawl():
             if cid in crawlers:
                 c = crawlers[cid]
                 c.stop()
-                # Not: shared visited diske yazılmıyor
-                # Aynı anda çalışan crawlerlar memory'de paylaşır
-                # Sıralı crawlerlar index.json üzerinden duplicate kontrolü yapar
+        save_pdata()
+
     threading.Thread(target=do_stop, daemon=True).start()
     return jsonify({"status": "stopping", "crawler_id": cid})
 
@@ -792,6 +807,42 @@ def search():
     return jsonify({"results": results[:20], "total": len(results)})
 
 
+@app.route("/search", methods=["GET"])
+def search_get():
+    """Quiz GET endpoint: /search?query=<word>&sortBy=relevance"""
+    query   = request.args.get("query", "").strip()
+    sort_by = request.args.get("sortBy", "relevance")  # noqa: F841 (future use)
+
+    with crawlers_lock:
+        targets = list(crawlers.values())
+
+    # Aktif crawler yoksa disk'ten yükle
+    if not targets:
+        from crawler import InvertedIndex
+        import glob as _glob
+        tmp = InvertedIndex()
+        for idx_path in _glob.glob("storage/crawlers/*/index.json"):
+            try:
+                tmp.load(idx_path)
+            except Exception:
+                pass
+        targets = [type("_C", (), {"search": lambda self, q: tmp.search(q), "crawler_id": "disk"})()]
+
+    if not query or not targets:
+        return jsonify({"results": [], "total": 0})
+
+    combined: dict[str, dict] = {}
+    for c in targets:
+        for r in c.search(query):
+            url = r["url"]
+            if url not in combined or r.get("relevance_score", 0) > combined[url].get("relevance_score", 0):
+                combined[url] = r
+                combined[url]["crawler_id"] = getattr(c, "crawler_id", "?")
+
+    results = sorted(combined.values(), key=lambda x: x.get("relevance_score", 0), reverse=True)
+    return jsonify({"results": results[:20], "total": len(results)})
+
+
 @app.route("/stream")
 def stream():
     """Server-Sent Events — her saniye tum crawler metriklerini gonderir."""
@@ -827,7 +878,7 @@ def stream():
 @app.route("/crawler/<cid>/logs")
 def get_logs(cid):
     """Son N log satırını döndür."""
-    path = f"storage/crawlers/{cid}/logs.jsonl"
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "storage", "crawlers", cid, "logs.jsonl")
     import os, json as _json
     if not os.path.exists(path):
         return jsonify({"logs": []})
@@ -870,12 +921,24 @@ def get_visited(cid):
 
 @app.route("/shared/visited")
 def get_shared_visited():
-    """Domain bazlı shared visited set'leri (bellekten)."""
+    """Tüm crawler'ların visited URL'lerini domain bazında gösterir."""
     result = {}
-    for domain, vset in shared_visited_store.items():
-        with shared_visited_locks.get(domain, threading.Lock()):
-            urls = sorted(vset)
-        result[domain] = {"size": len(urls), "urls": urls[:200]}
+    with crawlers_lock:
+        for cid2, c in crawlers.items():
+            import urllib.parse as _up2
+            domain = _up2.urlparse(c.seed_url).netloc
+            with c._visited_lock:
+                urls = sorted(c._visited)
+            if domain not in result:
+                result[domain] = {"size": 0, "urls": [], "crawlers": []}
+            result[domain]["crawlers"].append(cid2)
+            # Unique URL'leri birleştir
+            existing = set(result[domain]["urls"])
+            for u in urls:
+                if u not in existing:
+                    result[domain]["urls"].append(u)
+                    existing.add(u)
+            result[domain]["size"] = len(result[domain]["urls"])
     return jsonify(result)
 
 
@@ -892,13 +955,10 @@ def clear_all():
                 c.stats.running = False
         crawlers.clear()
 
-    # Shared visited sıfırla
-    shared_visited_store.clear()
-    shared_visited_locks.clear()
-
     # Storage dosyalarını sil
     deleted = 0
-    for subdir in ["storage/crawlers", "storage/shared"]:
+    _base = os.path.dirname(os.path.abspath(__file__))
+    for subdir in [os.path.join(_base, "storage", "crawlers"), os.path.join(_base, "storage", "shared")]:
         if os.path.exists(subdir):
             for entry in os.scandir(subdir):
                 if entry.is_dir():
@@ -915,5 +975,5 @@ def clear_all():
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
     print("\n  MiniSearch Web Dashboard")
-    print("  → http://localhost:5000\n")
-    app.run(debug=False, threaded=True, port=5000)
+    print("  → http://localhost:3600\n")
+    app.run(debug=False, threaded=True, port=3600)

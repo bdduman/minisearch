@@ -1,7 +1,7 @@
 # MiniSearch 🔍
 **Concurrent Web Crawler & Real-Time Search Engine**  
 ITU — AI Aided Computer Engineering, Homework 1
-
+Berdan Duman 150210029
 ---
 
 ## Overview
@@ -114,4 +114,5 @@ storage/
 | Relevancy scoring | ✅ |
 | Real-time web dashboard (SSE) | ✅ |
 | Persistence — resume after interruption | ✅ (bonus) |
-| Multiple concurrent crawlers | ✅ (bonus) |
+| Multiple concurrent crawlers | ✅ |
+# minisearch
