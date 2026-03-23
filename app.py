@@ -30,19 +30,20 @@ crawlers_lock = threading.Lock()
 
 
 def save_pdata():
-    """Tüm crawler'ların indeksini birleştirip data/storage/p.data'ya yazar."""
+    """Tüm crawler'ların indeksini birleştirip harf bazlı .data dosyalarına yazar (a.data, b.data, ...)."""
     _base = os.path.dirname(os.path.abspath(__file__))
     _pdata_dir = os.path.join(_base, "data", "storage")
     os.makedirs(_pdata_dir, exist_ok=True)
-    _pdata_path = os.path.join(_pdata_dir, "p.data")
 
-    all_entries = []
+    # Harf bazlı gruplama: ilk karaktere göre
+    buckets: dict[str, list[tuple]] = {}
     with crawlers_lock:
         for c in crawlers.values():
             with c.index._lock:
                 for word, entries in c.index._index.items():
+                    first_char = word[0] if word else "_"
                     for entry in entries:
-                        all_entries.append((
+                        buckets.setdefault(first_char, []).append((
                             word,
                             entry.get("url", ""),
                             entry.get("origin_url", ""),
@@ -50,11 +51,15 @@ def save_pdata():
                             entry.get("frequency", 0),
                         ))
 
-    all_entries.sort(key=lambda x: (x[0], x[1]))
-    with open(_pdata_path, "w", encoding="utf-8") as f:
-        for word, url, orig, depth, freq in all_entries:
-            f.write(f"{word} {url} {orig} {depth} {freq}\n")
-    log.info(f"p.data kaydedildi: {_pdata_path} ({len(all_entries)} entry, {len(set(c.crawler_id for c in crawlers.values()))} crawler)")
+    total = 0
+    for char, entries in buckets.items():
+        entries.sort(key=lambda x: (x[0], x[1]))
+        filepath = os.path.join(_pdata_dir, f"{char}.data")
+        with open(filepath, "w", encoding="utf-8") as f:
+            for word, url, orig, depth, freq in entries:
+                f.write(f"{word} {url} {orig} {depth} {freq}\n")
+        total += len(entries)
+    log.info(f"data/storage kaydedildi: {total} entry, {len(buckets)} dosya, {len(set(c.crawler_id for c in crawlers.values()))} crawler")
 
 
 # ---------------------------------------------------------------------------
